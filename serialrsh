@@ -106,8 +106,8 @@ class SerialHandle:
     self.serial.flush()
     return total
   
-  def _send_eot(self,n=5):
-    self.serial.write(' '.join(['\x04']*n)+'\n')
+  def _send_eot(self,n=3):
+    self.serial.write(''.join(['\x04']*n))
   
   # Correct uuencoding available only in python 3.7 (changes in binascii)
   if sys.version_info >= (3.7):
@@ -156,7 +156,7 @@ class SerialHandle:
     input_file.seek(0)
     total = 0
     # the true name of Ba'al, the soul eater...
-    self.serial.write('sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
+    self.serial.write(translator_pre+'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
     self.serial.flush()
     while True:
       block = input_file.read(blocksize)
@@ -189,16 +189,12 @@ class SerialHandle:
         else:
           shutil.copyfileobj(input_file,compressed_file)
       temp_file.seek(0)
-      with open('/tmp/pytest.txt.gz','wb') as g:
-        shutil.copyfileobj(temp_file,g)
-      temp_file.seek(0)
-      self._hexlify_upload(temp_file,translator_post='|xargs printf > '+remote_filename_gz,translator_pre='zcat - |',blocksize=blocksize)
-      #self.notify('Decompressing file, please wait...')
-      #if overwrite:
-        #self.serial.write('rm {0} 2> /dev/null\n'.format(remote_filename))
-      #self.serial.write('gunzip {0}\n'.format(remote_filename_gz))
-      " gunzip automatically removes its input "
-      #self.serial.write('rm {0}\n'.format(remote_filename_gz))
+      self.upload_file(temp_file,remote_filename_gz,blocksize=blocksize)
+      self.notify('Decompressing file, please wait...')
+      if overwrite:
+        self.serial.write('rm {0} 2> /dev/null\n'.format(remote_filename))
+      " gunzip automatically removes its input, but it may fail "
+      self.serial.write('gunzip {0} || rm {0}\n'.format(remote_filename_gz))
       self.serial.flush()
       self.notify('Upload complete!')
   
@@ -206,7 +202,7 @@ class SerialHandle:
     remote_filename = remote_path+'.tar'
     if compression == 'gz':
       remote_filename = remote_filename+'.gz'
-      decompress='zcat '+remote_filename_tgz+' |'
+      decompress='zcat '+remote_filename+' |'
       tar_output='-'
     else:
       decompress=''
@@ -216,9 +212,9 @@ class SerialHandle:
       compressed_file.add(input_path,arcname=remote_path)
       compressed_file.close()
       temp_file.seek(0)
-      self.upload_file_hexlify(temp_file.name,remote_filename,blocksize)
+      self.upload_file(temp_file.name,remote_filename,blocksize)
       self.notify('Decompressing file, please wait...')
-      self.serial.write(decompress+'tar -xf -\n'.format(remote_filename))
+      self.serial.write(decompress+'tar -xf {0}\n'.format(tar_output))
       self.serial.flush()
       self.notify('Upload complete!')
       
@@ -229,14 +225,14 @@ class SerialHandle:
       #return serialrsh_exec(device,code)
   #serial.execute(code)
 
-def serialrsh_upload(serial,source,destination,gz=True,**unused):
+def serialrsh_upload(serial,source,destination,compression='gz',force=False,**unused):
   if isinstance(serial,str):
     with SerialHandle(serial) as device:
       return serialrsh_upload(device,source,destination)
   if isinstance(source,str) and os.path.isdir(source):
-    return serial.upload_folder_tar(source,destination)
-  if gz:
-    return serial.upload_file_gzip(source,destination)
+    return serial.upload_folder_tar(source,destination,compression)
+  if compression == 'gz':
+    return serial.upload_file_gzip(source,destination,overwrite=force)
   return serial.upload_file(source,destination)
 
 
@@ -246,13 +242,15 @@ def execute(argv=sys.argv[1:]):
   """Command line tool entry point"""
   parser = argparse.ArgumentParser(description='Connect to a remote linux/unix-like OS using the serial')
   parser.add_argument('--device',dest='serial',metavar='dev',type=str,default='/dev/ttyUSB0',help='Port device')
+  #parser.add_argument('--baudrate',dest='baudrate',metavar='baudps',type=int,default=115200,help='Baud rate')
   #parser.add_argument('command',metavar='cmd',type=str,nargs=1,help='Command to execute')
   subparsers = parser.add_subparsers(help='Available commands')
   #exec_parser = subparsers.add_parser('exec',help='Exec commands in remote device')
   #exec_parser.add_argument('code',metavar='code',type=str,help='Code to be executed')
   #exec_parser.set_defaults(func=serialrsh_exec)
   upload_parser = subparsers.add_parser('upload',help='Upload a file/folder to remote device')
-  upload_parser.add_argument('-z',help='gzip data during transmission')
+  upload_parser.add_argument('--compression',dest='compression',default='gz',choices=['none','gz'],help='Compress data during transmission')
+  upload_parser.add_argument('-f',dest='force',action='store_true',help='Overwrite existing destinations')
   upload_parser.add_argument('source',metavar='src',type=str,help='Local file/folder to copy')
   upload_parser.add_argument('destination',metavar='dst',type=str,help='Remote destination')
   upload_parser.set_defaults(func=serialrsh_upload)
