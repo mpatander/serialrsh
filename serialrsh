@@ -1,0 +1,276 @@
+#! /usr/bin/python
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Author: Marco Patander
+# Date:   15 sept 2017
+
+
+
+import sys
+import tempfile
+import binascii
+import gzip
+import shutil
+import tarfile
+import time
+import uu
+import os
+
+import serial
+import codecs
+#from serial.tools.list_ports import comports
+#from serial.tools import hexlify_codec
+
+
+
+
+
+
+#import curses
+#class Console:
+  #""" User interface """
+  #def __init__(self):
+    #pass
+  
+  
+
+
+class SerialHandle:
+  def __init__(self,dev):
+    self.notify = lambda s: sys.stdout.write(s+'\n')
+    self.serial = serial.serial_for_url(dev,115200,
+                                        bytesize=serial.EIGHTBITS,
+                                        parity=serial.PARITY_NONE,
+                                        stopbits=serial.STOPBITS_ONE,
+                                        xonxoff=False,rtscts=False,
+                                        do_not_open=True)
+    #self.serial.port = dev
+    
+    
+    
+  def __enter__(self):
+    self.serial.open()
+    #sys.stderr.write("\n--- Settings: {p.name}  {p.baudrate},{p.bytesize},{p.parity},{p.stopbits}\n".format(
+        #p=self.serial))
+    #sys.stderr.write('--- RTS: {:8}  DTR: {:8}  BREAK: {:8}\n'.format(
+        #('active' if self.serial.rts else 'inactive'),
+        #('active' if self.serial.dtr else 'inactive'),
+        #('active' if self.serial.break_condition else 'inactive')))
+    #try:
+      #sys.stderr.write('--- CTS: {:8}  DSR: {:8}  RI: {:8}  CD: {:8}\n'.format(
+          #('active' if self.serial.cts else 'inactive'),
+          #('active' if self.serial.dsr else 'inactive'),
+          #('active' if self.serial.ri else 'inactive'),
+          #('active' if self.serial.cd else 'inactive')))
+    #except serial.SerialException:
+        ## on RFC 2217 ports, it can happen if no modem state notification was
+        ## yet received. ignore this error.
+        #return self
+    #sys.stderr.write('--- software flow control: {}\n'.format('active' if self.serial.xonxoff else 'inactive'))
+    #sys.stderr.write('--- hardware flow control: {}\n'.format('active' if self.serial.rtscts else 'inactive'))
+    return self
+    
+  def __exit__(self,t,val,tb):
+    self.serial.flush()
+    self.serial.close()
+    
+  def upload_filepart(self,input_file,remote_filename,blocksize=1024,blockcount=None):
+    total = 0
+    count = 0
+    while blockcount is None or count < blockcount:
+      count += 1
+      self.serial.write('cat > {0}.part\n'.format(remote_filename))
+      self.serial.flush()
+      block = input_file.read(blocksize)
+      if not block:
+        break
+      total += len(block)
+      self.serial.write(block+'\x04\x04')
+      self.serial.flush()
+      if count == 2:
+        sys.exit(1)
+      self.serial.write('cat {0}.part >> {0}\n'.format(remote_filename))
+      self.serial.flush()
+    self.serial.write('rm {0}.part\n'.format(remote_filename))
+    self.serial.flush()
+    return total
+  
+  def _send_eot(self,n=5):
+    self.serial.write(' '.join(['\x04']*n)+'\n')
+  
+  # Correct uuencoding available only in python 3.7 (changes in binascii)
+  if sys.version_info >= (3.7):
+    def upload_file_uuencoding(self,input_file,remote_filename,blocksize=1024,splitted=False):
+      with tempfile.NamedTemporaryFile() as encoded_file:
+        self.notify('Encoding file, please wait...')
+        uu.encode(input_file,encoded_file,backtick=True)
+        encoded_file.flush()
+        encoded_file.seek(0,2)
+        file_size=encoded_file.tell()
+        encoded_file.seek(0)
+        total = 0
+        if splitted:
+          while True:
+            total += self.upload_filepart(encoded_file,remote_filename+'.download',blocksize,1)
+            if total == file_size:
+              break
+            self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
+          self.notify('File transfer complete, decoding...')
+          self.serial.write('uudecode -o {0} {0}.download\n'.format(remote_filename))
+          #self.serial.write('rm {0}.download\n'.format(remote_filename))
+          self.serial.flush()
+        else:
+          self.serial.write('uudecode > '+remote_filename+'\n')
+          self.serial.flush()
+          while True:
+            block = encoded_file.read(blocksize)
+            if not block:
+              break
+            total += len(block)
+            self.serial.write(block)
+            self.serial.flush()
+            self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
+          self._send_eot()
+          self.serial.flush()
+        self.notify('File upload completed ({0} bytes)!'.format(total))
+  
+  
+  
+  def _hexlify_upload(self,input_file_,translator_post,translator_pre='',blocksize=1024):
+    input_file = input_file_
+    if isinstance(input_file_,str):
+      input_file = open(input_file_,'rb')
+    input_file.seek(0,2)
+    file_size=input_file.tell()
+    input_file.seek(0)
+    total = 0
+    # the true name of Ba'al, the soul eater...
+    self.serial.write('sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
+    self.serial.flush()
+    while True:
+      block = input_file.read(blocksize)
+      if not block:
+        break
+      total += len(block)
+      self.serial.write(binascii.b2a_hex(block))
+      self.serial.flush()
+      self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
+    self._send_eot()
+    self.serial.flush()
+    self.notify('File upload completed ({0} bytes)!'.format(total))
+    if isinstance(input_file_,str):
+      input_file.close()
+  
+  #def execute(self,code):
+    #self._hexlify_upload(code,translator='|xargs sh')
+  
+  def upload_file(self,input_file,remote_filename,blocksize=1024):
+    self._hexlify_upload(input_file,translator_post='|xargs printf > '+remote_filename,blocksize=blocksize)
+  
+  def upload_file_gzip(self,input_file,remote_filename,blocksize=1024,overwrite=False):
+    with tempfile.NamedTemporaryFile() as temp_file:
+      remote_filename_gz = remote_filename+'.gz'
+      with gzip.open(temp_file.name,'wb') as compressed_file:
+        self.notify('Compressing file, please wait...')
+        if isinstance(input_file,str):
+          with open(input_file,'rb') as input_file_obj:
+            shutil.copyfileobj(input_file_obj,compressed_file)
+        else:
+          shutil.copyfileobj(input_file,compressed_file)
+      temp_file.seek(0)
+      with open('/tmp/pytest.txt.gz','wb') as g:
+        shutil.copyfileobj(temp_file,g)
+      temp_file.seek(0)
+      self._hexlify_upload(temp_file,translator_post='|xargs printf > '+remote_filename_gz,translator_pre='zcat - |',blocksize=blocksize)
+      #self.notify('Decompressing file, please wait...')
+      #if overwrite:
+        #self.serial.write('rm {0} 2> /dev/null\n'.format(remote_filename))
+      #self.serial.write('gunzip {0}\n'.format(remote_filename_gz))
+      " gunzip automatically removes its input "
+      #self.serial.write('rm {0}\n'.format(remote_filename_gz))
+      self.serial.flush()
+      self.notify('Upload complete!')
+  
+  def upload_folder_tar(self,input_path,remote_path,compression='gz',blocksize=1024):
+    remote_filename = remote_path+'.tar'
+    if compression == 'gz':
+      remote_filename = remote_filename+'.gz'
+      decompress='zcat '+remote_filename_tgz+' |'
+      tar_output='-'
+    else:
+      decompress=''
+      tar_output=remote_filename
+    with tempfile.NamedTemporaryFile() as temp_file:
+      compressed_file = tarfile.open(temp_file.name,'w:'+compression)
+      compressed_file.add(input_path,arcname=remote_path)
+      compressed_file.close()
+      temp_file.seek(0)
+      self.upload_file_hexlify(temp_file.name,remote_filename,blocksize)
+      self.notify('Decompressing file, please wait...')
+      self.serial.write(decompress+'tar -xf -\n'.format(remote_filename))
+      self.serial.flush()
+      self.notify('Upload complete!')
+      
+  
+#def serialrsh_exec(serial,code,**unused):
+  #if isinstance(serial,str):
+    #with SerialHandle(serial) as device:
+      #return serialrsh_exec(device,code)
+  #serial.execute(code)
+
+def serialrsh_upload(serial,source,destination,gz=True,**unused):
+  if isinstance(serial,str):
+    with SerialHandle(serial) as device:
+      return serialrsh_upload(device,source,destination)
+  if isinstance(source,str) and os.path.isdir(source):
+    return serial.upload_folder_tar(source,destination)
+  if gz:
+    return serial.upload_file_gzip(source,destination)
+  return serial.upload_file(source,destination)
+
+
+import argparse
+
+def execute(argv=sys.argv[1:]):
+  """Command line tool entry point"""
+  parser = argparse.ArgumentParser(description='Connect to a remote linux/unix-like OS using the serial')
+  parser.add_argument('--device',dest='serial',metavar='dev',type=str,default='/dev/ttyUSB0',help='Port device')
+  #parser.add_argument('command',metavar='cmd',type=str,nargs=1,help='Command to execute')
+  subparsers = parser.add_subparsers(help='Available commands')
+  #exec_parser = subparsers.add_parser('exec',help='Exec commands in remote device')
+  #exec_parser.add_argument('code',metavar='code',type=str,help='Code to be executed')
+  #exec_parser.set_defaults(func=serialrsh_exec)
+  upload_parser = subparsers.add_parser('upload',help='Upload a file/folder to remote device')
+  upload_parser.add_argument('-z',help='gzip data during transmission')
+  upload_parser.add_argument('source',metavar='src',type=str,help='Local file/folder to copy')
+  upload_parser.add_argument('destination',metavar='dst',type=str,help='Remote destination')
+  upload_parser.set_defaults(func=serialrsh_upload)
+  args = parser.parse_args(argv)
+  args.func(**vars(args))
+  
+  #with SerialHandle('/dev/ttyUSB0') as ser:
+    #ser.serial.write('cd /tmp\n')
+    #ser.serial.flush()
+    #ser.upload_folder_tgz('/nfs/cv1/work/mpatander/cv1/board/scripts/system','system')
+    ##ser.upload_file_uuencoding('/tmp/test.txt','test.txt',500,True)
+    ##ser.upload_file_gzip('/tmp/test.txt','test.txt',500,overwrite=True)
+  ##ser.serial.flush()
+  ##ser.serial.close()
+
+
+if __name__ == '__main__':
+  execute()
+
+
+
