@@ -56,6 +56,7 @@ class SerialHandle:
                                         xonxoff=False,rtscts=False,
                                         do_not_open=True)
     #self.serial.port = dev
+    self.execproxy = '/tmp/stdin'
     
     
     
@@ -146,6 +147,17 @@ class SerialHandle:
         self.notify('File upload completed ({0} bytes)!'.format(total))
   
   
+  def _hexlify_send(self,input_string,translator_post,translator_pre='',blocksize=1024):
+    #file_size=len(input_string)
+    total = 0
+    # the true name of Ba'al, the soul eater...
+    self.serial.write(translator_pre+'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
+    self.serial.flush()
+    self.serial.write(binascii.b2a_hex(input_string))
+    self._send_eot()
+    self.serial.write('\n')
+    self.serial.flush()
+    #self.notify('File upload completed ({0} bytes)!'.format(total))
   
   def _hexlify_upload(self,input_file_,translator_post,translator_pre='',blocksize=1024):
     input_file = input_file_
@@ -172,8 +184,11 @@ class SerialHandle:
     if isinstance(input_file_,str):
       input_file.close()
   
-  #def execute(self,code):
-    #self._hexlify_upload(code,translator='|xargs sh')
+  def execute(self,code):
+    self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};rm {0}'.format(self.execproxy))
+  
+  def subshell_execute(self,code):
+    self._hexlify_send(code,translator_post='|xargs printf|sh')
   
   def upload_file(self,input_file,remote_filename,blocksize=1024):
     self._hexlify_upload(input_file,translator_post='|xargs printf > '+remote_filename,blocksize=blocksize)
@@ -198,7 +213,7 @@ class SerialHandle:
       self.serial.flush()
       self.notify('Upload complete!')
   
-  def upload_folder_tar(self,input_path,remote_path,compression='gz',blocksize=1024):
+  def upload_folder_tar(self,input_path,remote_path,compression='gz',options='o',blocksize=1024):
     remote_filename = remote_path+'.tar'
     if compression == 'gz':
       remote_filename = remote_filename+'.gz'
@@ -214,16 +229,22 @@ class SerialHandle:
       temp_file.seek(0)
       self.upload_file(temp_file.name,remote_filename,blocksize)
       self.notify('Decompressing file, please wait...')
-      self.serial.write(decompress+'tar -xf {0}\n'.format(tar_output))
+      self.serial.write(decompress+'tar -x{1}f {0}\n'.format(tar_output,options))
       self.serial.flush()
       self.notify('Upload complete!')
       
   
-#def serialrsh_exec(serial,code,**unused):
-  #if isinstance(serial,str):
-    #with SerialHandle(serial) as device:
-      #return serialrsh_exec(device,code)
-  #serial.execute(code)
+def serialrsh_exec(serial,code,**unused):
+  if isinstance(serial,str):
+    with SerialHandle(serial) as device:
+      return serialrsh_exec(device,code)
+  serial.execute(code)
+
+def serialrsh_subexec(serial,code,**unused):
+  if isinstance(serial,str):
+    with SerialHandle(serial) as device:
+      return serialrsh_subexec(device,code)
+  serial.subshell_execute(code)
 
 def serialrsh_upload(serial,source,destination,compression='gz',force=False,**unused):
   if isinstance(serial,str):
@@ -245,9 +266,9 @@ def execute(argv=sys.argv[1:]):
   #parser.add_argument('--baudrate',dest='baudrate',metavar='baudps',type=int,default=115200,help='Baud rate')
   #parser.add_argument('command',metavar='cmd',type=str,nargs=1,help='Command to execute')
   subparsers = parser.add_subparsers(help='Available commands')
-  #exec_parser = subparsers.add_parser('exec',help='Exec commands in remote device')
-  #exec_parser.add_argument('code',metavar='code',type=str,help='Code to be executed')
-  #exec_parser.set_defaults(func=serialrsh_exec)
+  exec_parser = subparsers.add_parser('exec',help='Exec commands in remote device')
+  exec_parser.add_argument('code',metavar='code',type=str,help='Code to be executed')
+  exec_parser.set_defaults(func=serialrsh_exec)
   upload_parser = subparsers.add_parser('upload',help='Upload a file/folder to remote device')
   upload_parser.add_argument('--compression',dest='compression',default='gz',choices=['none','gz'],help='Compress data during transmission')
   upload_parser.add_argument('-f',dest='force',action='store_true',help='Overwrite existing destinations')
@@ -257,14 +278,6 @@ def execute(argv=sys.argv[1:]):
   args = parser.parse_args(argv)
   args.func(**vars(args))
   
-  #with SerialHandle('/dev/ttyUSB0') as ser:
-    #ser.serial.write('cd /tmp\n')
-    #ser.serial.flush()
-    #ser.upload_folder_tgz('/nfs/cv1/work/mpatander/cv1/board/scripts/system','system')
-    ##ser.upload_file_uuencoding('/tmp/test.txt','test.txt',500,True)
-    ##ser.upload_file_gzip('/tmp/test.txt','test.txt',500,overwrite=True)
-  ##ser.serial.flush()
-  ##ser.serial.close()
 
 
 if __name__ == '__main__':
