@@ -13,9 +13,11 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # Author: Marco Patander
-# Date:   15 sept 2017
-
-
+# Date:   sept 2017
+# Brief:  A remote shell over a serial connection to connect to remote shell
+#
+# Currently tested with an ash remote shell
+# 
 
 import sys
 import tempfile
@@ -28,11 +30,32 @@ import uu
 import os
 
 import serial
-import codecs
+#import codecs
 #from serial.tools.list_ports import comports
 #from serial.tools import hexlify_codec
+import threading
+import fileinput
 
 
+def dump_serial_info(serial,out=sys.stdout):
+  out.write("--- Settings: {p.name}  {p.baudrate},{p.bytesize},{p.parity},{p.stopbits}\n".format(
+      p=serial))
+  out.write('--- RTS: {:8}  DTR: {:8}  BREAK: {:8}\n'.format(
+      ('active' if serial.rts else 'inactive'),
+      ('active' if serial.dtr else 'inactive'),
+      ('active' if serial.break_condition else 'inactive')))
+  try:
+    out.write('--- CTS: {:8}  DSR: {:8}  RI: {:8}  CD: {:8}\n'.format(
+        ('active' if serial.cts else 'inactive'),
+        ('active' if serial.dsr else 'inactive'),
+        ('active' if serial.ri else 'inactive'),
+        ('active' if serial.cd else 'inactive')))
+  except serial.SerialException:
+      # on RFC 2217 ports, it can happen if no modem state notification was
+      # yet received. ignore this error.
+      return self
+  out.write('--- software flow control: {}\n'.format('active' if serial.xonxoff else 'inactive'))
+  out.write('--- hardware flow control: {}\n'.format('active' if serial.rtscts else 'inactive'))
 
 
 
@@ -45,16 +68,35 @@ import codecs
   
   
 
+class Receiver:
+  def __init__(self):
+    self._reader_alive = False
+  
+  def start_reader(self):
+    self._receiver_thread = threading.Thread(target=self.reader_loop,name='ReaderThread')
+    self._receiver_thread.daemon = True
+    self._receiver_thread.start()
+  
+  def stop_reader(self):
+    self._reader_alive = False
+    self.cancel_read()
+    self._receiver_thread.join()
+  
+  def reader_loop(self):
+    self._reader_alive = True
+    while self._reader_alive:
+      data = self._read_or_wait()
+      if data:
+        sys.stdout.write(data)
+        sys.stdout.flush()
 
-class SerialHandle:
+
+class SerialHandle(Receiver):
   def __init__(self,dev):
     self.notify = lambda s: sys.stdout.write(s+'\n')
-    self.serial = serial.serial_for_url(dev,115200,
-                                        bytesize=serial.EIGHTBITS,
-                                        parity=serial.PARITY_NONE,
-                                        stopbits=serial.STOPBITS_ONE,
-                                        xonxoff=False,rtscts=False,
-                                        do_not_open=True)
+    self.serial = dev
+    if not hasattr(self.serial, 'cancel_read'):
+      self.serial.timeout = 0.1
     #self.serial.port = dev
     self.execproxy = '/tmp/stdin'
     
@@ -62,30 +104,52 @@ class SerialHandle:
     
   def __enter__(self):
     self.serial.open()
-    #sys.stderr.write("\n--- Settings: {p.name}  {p.baudrate},{p.bytesize},{p.parity},{p.stopbits}\n".format(
-        #p=self.serial))
-    #sys.stderr.write('--- RTS: {:8}  DTR: {:8}  BREAK: {:8}\n'.format(
-        #('active' if self.serial.rts else 'inactive'),
-        #('active' if self.serial.dtr else 'inactive'),
-        #('active' if self.serial.break_condition else 'inactive')))
-    #try:
-      #sys.stderr.write('--- CTS: {:8}  DSR: {:8}  RI: {:8}  CD: {:8}\n'.format(
-          #('active' if self.serial.cts else 'inactive'),
-          #('active' if self.serial.dsr else 'inactive'),
-          #('active' if self.serial.ri else 'inactive'),
-          #('active' if self.serial.cd else 'inactive')))
-    #except serial.SerialException:
-        ## on RFC 2217 ports, it can happen if no modem state notification was
-        ## yet received. ignore this error.
-        #return self
-    #sys.stderr.write('--- software flow control: {}\n'.format('active' if self.serial.xonxoff else 'inactive'))
-    #sys.stderr.write('--- hardware flow control: {}\n'.format('active' if self.serial.rtscts else 'inactive'))
+    #dump_serial_info(self.serial)
+    self.serial.write('SERIALRSH_SAVED_ECHO=$(stty -g);stty -echo\n')
+    self.serial.flush()
+    self.ignore_lines = 1
+    time.sleep(0.1)
+    self.start_reader()
     return self
     
   def __exit__(self,t,val,tb):
     self.serial.flush()
+    time.sleep(0.1)
+    self.stop_reader()
+    self.serial.write('stty $SERIALRSH_SAVED_ECHO;unset SERIALRSH_SAVED_ECHO\n')
+    self.serial.flush()
     self.serial.close()
-    
+  
+  def cancel_read(self):
+    if hasattr(self.serial, 'cancel_read'):
+      self.serial.cancel_read()
+  
+  def _read_or_wait(self):
+    # TODO if possible ignore lines, fixing race with remote
+    #while True:
+    data = self.serial.read(self.serial.in_waiting or 1)
+    if not self._reader_alive:
+      # flush some pending output...
+      # TODO wait last codeline completion... but how to know when it completes?
+      while data:
+        sys.stdout.write(data)
+        sys.stdout.flush()
+        data = self.serial.read(self.serial.in_waiting)
+        if not data:
+          time.sleep(0.1)
+          data = self.serial.read(self.serial.in_waiting)
+      #if self.ignore_lines > 0:
+        #lf_cnt = data.count('\n')
+        #if lf_cnt >= self.ignore_lines:
+          #lines = data.split('\n')
+          #data = '\n'.join(lines[lf_cnt-self.ignore_lines:])
+        #else:
+          #data = None
+        #self.ignore_lines -= lf_cnt
+      #if data or not self._reader_alive:
+        #break
+    return data
+  
   def upload_filepart(self,input_file,remote_filename,blocksize=1024,blockcount=None):
     total = 0
     count = 0
@@ -155,7 +219,7 @@ class SerialHandle:
     self.serial.flush()
     self.serial.write(binascii.b2a_hex(input_string))
     self._send_eot()
-    self.serial.write('\n')
+    #self.serial.write('\n')
     self.serial.flush()
     #self.notify('File upload completed ({0} bytes)!'.format(total))
   
@@ -235,37 +299,38 @@ class SerialHandle:
       
   
 def serialrsh_exec(serial,code,**unused):
-  if isinstance(serial,str):
-    with SerialHandle(serial) as device:
-      return serialrsh_exec(device,code)
-  serial.execute(code)
+  #serial.execute(code)
+  ##if isinstance(code,str):
+  ##serial.execute(code)
+  ##for line in fileinput.input(['-']):
+  ##  serial.execute(line)
+  if code != '-':
+    serial.execute(code)
+  for line in fileinput.input(['-']):
+    serial.execute(line)
+  
+
 
 def serialrsh_subexec(serial,code,**unused):
-  if isinstance(serial,str):
-    with SerialHandle(serial) as device:
-      return serialrsh_subexec(device,code)
   serial.subshell_execute(code)
 
 def serialrsh_upload(serial,source,destination,compression='gz',force=False,**unused):
-  if isinstance(serial,str):
-    with SerialHandle(serial) as device:
-      return serialrsh_upload(device,source,destination)
   if isinstance(source,str) and os.path.isdir(source):
     return serial.upload_folder_tar(source,destination,compression)
   if compression == 'gz':
     return serial.upload_file_gzip(source,destination,overwrite=force)
   return serial.upload_file(source,destination)
 
+def serialrsh_sleep(time_seconds,**unused):
+  time.sleep(time_seconds)
+
 
 import argparse
 
 def execute(argv=sys.argv[1:]):
   """Command line tool entry point"""
-  parser = argparse.ArgumentParser(description='Connect to a remote linux/unix-like OS using the serial')
-  parser.add_argument('--device',dest='serial',metavar='dev',type=str,default='/dev/ttyUSB0',help='Port device')
-  #parser.add_argument('--baudrate',dest='baudrate',metavar='baudps',type=int,default=115200,help='Baud rate')
-  #parser.add_argument('command',metavar='cmd',type=str,nargs=1,help='Command to execute')
-  subparsers = parser.add_subparsers(help='Available commands')
+  commands_parser = argparse.ArgumentParser(description='Connect to a remote linux/unix-like OS using the serial')
+  subparsers = commands_parser.add_subparsers(title='Commands list',help='Available commands')
   exec_parser = subparsers.add_parser('exec',help='Exec commands in remote device')
   exec_parser.add_argument('code',metavar='code',type=str,help='Code to be executed')
   exec_parser.set_defaults(func=serialrsh_exec)
@@ -275,9 +340,32 @@ def execute(argv=sys.argv[1:]):
   upload_parser.add_argument('source',metavar='src',type=str,help='Local file/folder to copy')
   upload_parser.add_argument('destination',metavar='dst',type=str,help='Remote destination')
   upload_parser.set_defaults(func=serialrsh_upload)
-  args = parser.parse_args(argv)
-  args.func(**vars(args))
+  sleep_parser = subparsers.add_parser('sleep',help='Local sleep for some time')
+  sleep_parser.add_argument('time_seconds',type=float,help='Time to sleep (in seconds)')
+  sleep_parser.set_defaults(func=serialrsh_sleep)
   
+  main_parser = commands_parser
+  main_parser.add_argument('--device',dest='serial',metavar='dev',type=str,default='/dev/ttyUSB0',help='Port device')
+  main_parser.add_argument('--baudrate',dest='baudrate',metavar='baudps',type=int,default=115200,help='Baud rate')
+  #main_parser.add_argument('command',metavar='cmd',type=str,nargs=1,help='Command to execute')
+  
+  
+  #args = parser.parse_args(argv)
+  #args.func(**vars(args))
+  [args,rest] = main_parser.parse_known_args(argv)
+  with SerialHandle(serial.serial_for_url(args.serial,args.baudrate,
+                            bytesize=serial.EIGHTBITS,
+                            parity=serial.PARITY_NONE,
+                            stopbits=serial.STOPBITS_ONE,
+                            xonxoff=False,rtscts=False,
+                            do_not_open=True)) as serial_device:
+    while True:
+      args.serial = serial_device
+      args.func(**vars(args))
+      if not rest:
+        break
+      [args, rest] = commands_parser.parse_known_args(rest)
+  sys.stdout.write('\n')
 
 
 if __name__ == '__main__':
