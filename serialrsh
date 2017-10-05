@@ -161,10 +161,30 @@ class SerialHandle(Receiver):
       if not block:
         break
       total += len(block)
-      self.serial.write(block+'\x04\x04')
+      self.serial.write(block)
+      self._send_eot()
       self.serial.flush()
-      if count == 2:
-        sys.exit(1)
+      self.serial.write('cat {0}.part >> {0}\n'.format(remote_filename))
+      self.serial.flush()
+    self.serial.write('rm {0}.part\n'.format(remote_filename))
+    self.serial.flush()
+    return total
+  
+  def hexlify_upload_filepart(self,input_file,remote_filename,blocksize=1024,blockcount=None):
+    total = 0
+    count = 0
+    while blockcount is None or count < blockcount:
+      count += 1
+      # the true name of Ba'al, the soul eater...
+      self.serial.write('sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' | xargs printf > '+remote_filename+'.part\n')
+      self.serial.flush()
+      block = input_file.read(blocksize)
+      if not block:
+        break
+      total += len(block)
+      self.serial.write(binascii.b2a_hex(block))
+      self._send_eot()
+      self.serial.flush()
       self.serial.write('cat {0}.part >> {0}\n'.format(remote_filename))
       self.serial.flush()
     self.serial.write('rm {0}.part\n'.format(remote_filename))
@@ -223,7 +243,7 @@ class SerialHandle(Receiver):
     self.serial.flush()
     #self.notify('File upload completed ({0} bytes)!'.format(total))
   
-  def _hexlify_upload(self,input_file_,translator_post,translator_pre='',blocksize=1024):
+  def _hexlify_upload(self,input_file_,translator_post,translator_pre='',blocksize=1024,splitted=False):
     input_file = input_file_
     if isinstance(input_file_,str):
       input_file = open(input_file_,'rb')
@@ -231,31 +251,45 @@ class SerialHandle(Receiver):
     file_size=input_file.tell()
     input_file.seek(0)
     total = 0
-    # the true name of Ba'al, the soul eater...
-    self.serial.write(translator_pre+'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
-    self.serial.flush()
-    while True:
-      block = input_file.read(blocksize)
-      if not block:
-        break
-      total += len(block)
-      self.serial.write(binascii.b2a_hex(block))
+    if splitted:
+      pass
+      remote_filename = translator_post
+      while True:
+        total += self.hexlify_upload_filepart(input_file,remote_filename+'.download',blocksize,1)
+        if total == file_size:
+          break
+        self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
+      self.notify('File transfer complete, decoding...')
+      self.serial.write('mv {0}.download {0}\n'.format(remote_filename))
       self.serial.flush()
-      self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
-    self._send_eot()
-    self.serial.flush()
+    else:
+      # the true name of Ba'al, the soul eater...
+      self.serial.write(translator_pre+'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
+      self.serial.flush()
+      while True:
+        block = input_file.read(blocksize)
+        if not block:
+          break
+        total += len(block)
+        self.serial.write(binascii.b2a_hex(block))
+        self.serial.flush()
+        self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
+      self._send_eot()
+      self.serial.flush()
     self.notify('File upload completed ({0} bytes)!'.format(total))
     if isinstance(input_file_,str):
       input_file.close()
   
   def execute(self,code):
-    self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};rm {0}'.format(self.execproxy))
+    #self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};rm {0}'.format(self.execproxy))
+    self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};'.format(self.execproxy))
   
   def subshell_execute(self,code):
     self._hexlify_send(code,translator_post='|xargs printf|sh')
   
   def upload_file(self,input_file,remote_filename,blocksize=1024):
-    self._hexlify_upload(input_file,translator_post='|xargs printf > '+remote_filename,blocksize=blocksize)
+    #self._hexlify_upload(input_file,translator_post='|xargs printf > '+remote_filename,blocksize=blocksize)
+    self._hexlify_upload(input_file,translator_post=remote_filename,blocksize=blocksize,splitted=True)
   
   def upload_file_gzip(self,input_file,remote_filename,blocksize=1024,overwrite=False):
     with tempfile.NamedTemporaryFile() as temp_file:
@@ -286,6 +320,7 @@ class SerialHandle(Receiver):
     else:
       decompress=''
       tar_output=remote_filename
+      compression=''
     with tempfile.NamedTemporaryFile() as temp_file:
       compressed_file = tarfile.open(temp_file.name,'w:'+compression)
       compressed_file.add(input_path,arcname=remote_path)
@@ -306,6 +341,7 @@ def serialrsh_exec(serial,code,**unused):
   ##  serial.execute(line)
   if code != '-':
     serial.execute(code)
+    return
   for line in fileinput.input(['-']):
     serial.execute(line)
   
