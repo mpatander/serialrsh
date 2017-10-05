@@ -323,7 +323,7 @@ class SerialHandle(Receiver):
       self.serial.flush()
       self.notify('Upload complete!')
   
-  def upload_folder_tar(self,input_path,remote_path,compression='gz',options='o',blocksize=1024):
+  def upload_folder_tar(self,input_path,remote_path,compression='gz',options='o',dereference_links=False,blocksize=1024):
     remote_filename = remote_path+'.tar'
     if compression == 'gz':
       remote_filename = remote_filename+'.gz'
@@ -334,7 +334,7 @@ class SerialHandle(Receiver):
       tar_output=remote_filename
       compression=''
     with tempfile.NamedTemporaryFile() as temp_file:
-      compressed_file = tarfile.open(temp_file.name,'w:'+compression)
+      compressed_file = tarfile.open(temp_file.name,'w:'+compression,dereference=dereference_links)
       compressed_file.add(input_path,arcname=remote_path)
       compressed_file.close()
       temp_file.seek(0)
@@ -362,9 +362,9 @@ def serialrsh_exec(serial,code,**unused):
 def serialrsh_subexec(serial,code,**unused):
   serial.subshell_execute(code)
 
-def serialrsh_upload(serial,source,destination,compression='gz',force=False,**unused):
+def serialrsh_upload(serial,source,destination,compression='gz',force=False,dereference_links=False,**unused):
   if isinstance(source,str) and os.path.isdir(source):
-    return serial.upload_folder_tar(source,destination,compression)
+    return serial.upload_folder_tar(source,destination,compression,dereference_links=dereference_links)
   if compression == 'gz':
     return serial.upload_file_gzip(source,destination,overwrite=force)
   return serial.upload_file(source,destination)
@@ -384,6 +384,7 @@ def execute(argv=sys.argv[1:]):
   exec_parser.set_defaults(func=serialrsh_exec)
   upload_parser = subparsers.add_parser('upload',help='Upload a file/folder to remote device')
   upload_parser.add_argument('--compression',dest='compression',default='gz',choices=['none','gz'],help='Compress data during transmission')
+  upload_parser.add_argument('--deref',dest='dereference_links',action='store_true',help='Dereference symlinks')
   upload_parser.add_argument('-f',dest='force',action='store_true',help='Overwrite existing destinations')
   upload_parser.add_argument('source',metavar='src',type=str,help='Local file/folder to copy')
   upload_parser.add_argument('destination',metavar='dst',type=str,help='Remote destination')
