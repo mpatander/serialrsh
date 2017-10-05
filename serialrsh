@@ -59,6 +59,22 @@ def dump_serial_info(serial,out=sys.stdout):
 
 
 
+def fileblocks(input_file,blocksize,blockscount=None):
+  count = 0
+  while blockscount is None or count < blockscount:
+    count += 1
+    block = input_file.read(blocksize)
+    if not block:
+      break
+    yield block
+  
+
+def hexlify(input_generator):
+  for data in input_generator:
+    yield binascii.b2a_hex(data)
+  
+
+
 
 #import curses
 #class Console:
@@ -100,6 +116,8 @@ class SerialHandle(Receiver):
     #self.serial.port = dev
     self.execproxy = '/tmp/stdin'
     
+    # the true name of Ba'al, the soul eater...
+    self.unhexlify = 'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\''
     
     
   def __enter__(self):
@@ -108,7 +126,7 @@ class SerialHandle(Receiver):
     self.serial.write('SERIALRSH_SAVED_ECHO=$(stty -g);stty -echo\n')
     self.serial.flush()
     self.ignore_lines = 1
-    time.sleep(0.1)
+    time.sleep(0.2)
     self.start_reader()
     return self
     
@@ -150,46 +168,78 @@ class SerialHandle(Receiver):
         #break
     return data
   
-  def upload_filepart(self,input_file,remote_filename,blocksize=1024,blockcount=None):
-    total = 0
-    count = 0
-    while blockcount is None or count < blockcount:
-      count += 1
+  
+  def _upload(self,input_generator,cmd_pre,cmd_exec,cmd_post):
+    if cmd_pre:
+      cmd_pre()
+    for data in input_generator:
+      self.serial.write(data)
+      self.serial.flush()
+      if cmd_exec:
+        cmd_exec(data)
+    if cmd_post:
+      cmd_post()
+  
+  
+  def upload_filepart(self,input_generator,remote_filename):
+    def _pre():
       self.serial.write('cat > {0}.part\n'.format(remote_filename))
       self.serial.flush()
-      block = input_file.read(blocksize)
-      if not block:
-        break
-      total += len(block)
-      self.serial.write(block)
+    def _exec(data):
       self._send_eot()
       self.serial.flush()
       self.serial.write('cat {0}.part >> {0}\n'.format(remote_filename))
       self.serial.flush()
-    self.serial.write('rm {0}.part\n'.format(remote_filename))
-    self.serial.flush()
-    return total
+    def _post():
+      self.serial.write('rm {0}.part\n'.format(remote_filename))
+      self.serial.flush()
+    self._upload(input_generator,_pre,_exec,_post)
   
-  def hexlify_upload_filepart(self,input_file,remote_filename,blocksize=1024,blockcount=None):
-    total = 0
-    count = 0
-    while blockcount is None or count < blockcount:
-      count += 1
-      # the true name of Ba'al, the soul eater...
-      self.serial.write('sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' | xargs printf > '+remote_filename+'.part\n')
+  def hexlify_upload_filepart(self,input_generator,remote_filename):
+    def _pre():
+      self.serial.write('{0}|xargs printf > {1}.part\n'.format(self.unhexlify,remote_filename))
       self.serial.flush()
-      block = input_file.read(blocksize)
-      if not block:
-        break
-      total += len(block)
-      self.serial.write(binascii.b2a_hex(block))
+    def _exec(data):
       self._send_eot()
       self.serial.flush()
       self.serial.write('cat {0}.part >> {0}\n'.format(remote_filename))
       self.serial.flush()
-    self.serial.write('rm {0}.part\n'.format(remote_filename))
+    def _post():
+      self.serial.write('rm {0}.part\n'.format(remote_filename))
+      self.serial.flush()
+    self._upload(hexlify(input_generator),_pre,_exec,_post)
+    
+  def _hexlify_upload(self,input_file_,remote_filename,translator_post,translator_pre='',blocksize=1024,splitcount=1):
+    input_file = input_file_
+    if isinstance(input_file_,str):
+      input_file = open(input_file_,'rb')
+    input_file.seek(0,2)
+    file_size=input_file.tell()
+    input_file.seek(0)
+    total = 0
+    def _pre():
+      self.serial.write('{1}{0}{2}\n'.format(self.unexlify,translator_pre,translator_post))
+      self.serial.flush()
+    def _exec(data):
+      total += len(data)/2
+      self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
+    def _post():
+      self._send_eot()
+      self.serial.flush()
+    if splitcount == 0:
+      self._upload(hexlify(fileblocks(input_file,blocksize)),_pre,_exec,_post)
+    else:
+      while total != file_size:
+        self.hexlify_upload_filepart(fileblocks(input_file,blocksize,splitcount),remote_filename+'.download')
+        total = input_file.tell()
+        self.notify('File transfer progress: {:>3}% ({}/{})'.format(total*100/file_size,total,file_size))
+    self.serial.write('mv {0}.download {0}\n'.format(remote_filename))
     self.serial.flush()
-    return total
+    self.notify('File upload completed ({0} bytes)!'.format(total))
+    if isinstance(input_file_,str):
+      input_file.close()
+    
+  
   
   def _send_eot(self,n=3):
     self.serial.write(''.join(['\x04']*n))
@@ -234,8 +284,7 @@ class SerialHandle(Receiver):
   def _hexlify_send(self,input_string,translator_post,translator_pre='',blocksize=1024):
     #file_size=len(input_string)
     total = 0
-    # the true name of Ba'al, the soul eater...
-    self.serial.write(translator_pre+'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
+    self.serial.write('{1}{0}{2}\n'.format(self.unhexlify,translator_pre,translator_post))
     self.serial.flush()
     self.serial.write(binascii.b2a_hex(input_string))
     self._send_eot()
@@ -243,53 +292,16 @@ class SerialHandle(Receiver):
     self.serial.flush()
     #self.notify('File upload completed ({0} bytes)!'.format(total))
   
-  def _hexlify_upload(self,input_file_,translator_post,translator_pre='',blocksize=1024,splitted=False):
-    input_file = input_file_
-    if isinstance(input_file_,str):
-      input_file = open(input_file_,'rb')
-    input_file.seek(0,2)
-    file_size=input_file.tell()
-    input_file.seek(0)
-    total = 0
-    if splitted:
-      pass
-      remote_filename = translator_post
-      while True:
-        total += self.hexlify_upload_filepart(input_file,remote_filename+'.download',blocksize,1)
-        if total == file_size:
-          break
-        self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
-      self.notify('File transfer complete, decoding...')
-      self.serial.write('mv {0}.download {0}\n'.format(remote_filename))
-      self.serial.flush()
-    else:
-      # the true name of Ba'al, the soul eater...
-      self.serial.write(translator_pre+'sed \'s/\([0-9A-F]\{2\}\)/\\\\\\\\\\\\x\\1/gI\' '+translator_post+'\n')
-      self.serial.flush()
-      while True:
-        block = input_file.read(blocksize)
-        if not block:
-          break
-        total += len(block)
-        self.serial.write(binascii.b2a_hex(block))
-        self.serial.flush()
-        self.notify('File transfer progress: {:>3}%'.format(total*100/file_size))
-      self._send_eot()
-      self.serial.flush()
-    self.notify('File upload completed ({0} bytes)!'.format(total))
-    if isinstance(input_file_,str):
-      input_file.close()
   
   def execute(self,code):
-    #self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};rm {0}'.format(self.execproxy))
-    self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};'.format(self.execproxy))
+    self._hexlify_send(code,translator_post='|xargs printf > {0};source {0};rm {0}'.format(self.execproxy))
   
   def subshell_execute(self,code):
     self._hexlify_send(code,translator_post='|xargs printf|sh')
   
   def upload_file(self,input_file,remote_filename,blocksize=1024):
     #self._hexlify_upload(input_file,translator_post='|xargs printf > '+remote_filename,blocksize=blocksize)
-    self._hexlify_upload(input_file,translator_post=remote_filename,blocksize=blocksize,splitted=True)
+    self._hexlify_upload(input_file,remote_filename,translator_post=remote_filename,blocksize=blocksize)
   
   def upload_file_gzip(self,input_file,remote_filename,blocksize=1024,overwrite=False):
     with tempfile.NamedTemporaryFile() as temp_file:
@@ -328,7 +340,7 @@ class SerialHandle(Receiver):
       temp_file.seek(0)
       self.upload_file(temp_file.name,remote_filename,blocksize)
       self.notify('Decompressing file, please wait...')
-      self.serial.write(decompress+'tar -x{1}f {0}\n'.format(tar_output,options))
+      self.serial.write(decompress+'tar -x{1}f {0};rm {2}\n'.format(tar_output,options,remote_filename))
       self.serial.flush()
       self.notify('Upload complete!')
       
